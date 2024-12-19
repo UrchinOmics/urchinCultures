@@ -1,0 +1,18 @@
+#cjm 12/2/2024
+the goal of this work is to integrate the scRNAseq from the cell cultures with the scRNAseq developmental atlas. 
+we intend to show that cells in culture co-cluster with developmental cell types. 
+however, it is quite possible that the cultured cells will be rather distinct. 
+
+either way, the goal is the same. integrate the data and put them onto the same umap space. 
+then we do clustering and ask if clusters are composed of cells both from cultures and the atlas, or whether they're separate. 
+
+Bash scripts are numbered in the order they were run. 
+first up, i made a reference transcriptome with cellranger using annotations that I pulled from NCBI. (1_mkrefgenome.sh)
+I put all the reads into the same folder and generated a sample list. these are just base sample names. (2_mvreads.sh)
+
+Submitted cellranger count jobs for each sample via sbatch wrap. see scripts/3_count.sh for specific count parameters. (3_count.sh)
+
+Clean things up a little. Making an output directory for cellranger and copy the output over there.  
+
+
+at this point, we move into R. See scRNA_seq_integration_analysis.R
