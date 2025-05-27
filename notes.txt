@@ -31,6 +31,7 @@ I additionally provide the following files:
 3. pull_massri_2021_data.R - Code sourced in the main .Rmd document pull the seurat object for the original atlas analysis from SRA to use for comparison. 
   a. note, I processed all data from raw reads obtained from SRA. The analysis in the Massri 2021 paper uses an older version of the Lvar_3.0 genome annotations, and is not directly comparable to the version of the atlas processed with the newer annotations, though it is still useful for certain "sanity checks".
 4. ribosomal_LOCs.txt - a list of ribosomal gene names used in this analysis during QC steps. 
+5. loc_map.tsv - identity of clusters in the seurat object from Massri et al. 2021 paper, provided for convenience if using the original atlas as a reference. 
 
 Some big changes from the last analysis: 
 1. I now provide an estimate of developmental age for cultured cells which strongly points towards a naive or stem-like state. Ultimately, I want to run the cytoTRACE algorithm on these data, but I need to refactor that code in order to more efficently use memory for a data set of this size, which is no easy task and is squarely in the domain of a second paper. 
@@ -56,4 +57,4 @@ I put all the reads into the same folder and generated a sample list. these are 
 Submitted cellranger count jobs for each sample via sbatch wrap. see scripts/3_count.sh for specific count parameters. (3_count.sh)
 Clean things up a little. Making an output directory for cellranger and copy the output over there.  
 
-at this point, I move into R. See scRNA_seq_integration_analysis.R
+At this point, I move into R. See scRNA_seq_integration_analysis.R
