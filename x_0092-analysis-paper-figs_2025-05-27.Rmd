@@ -1,0 +1,1883 @@
+---
+title: "Integrated_scRNAseq_revised"
+author: "Carl Manner"
+date: "2025-05-23"
+output: html_document
+---
+#setup
+load libraries. not all of these were used in the analysis, presented in the paper, but all were active in my environment. Many of these were for exploratory analyses that didnt make it into the final paper. 
+
+```{r setup, include=FALSE}
+library(here)
+# Load libraries
+here::i_am(path = "x_0092_clean.Rmd")
+library(devtools)
+library(ggplot2)
+library(viridis)
+library(RColorBrewer)
+library(cowplot)
+library(Seurat)
+library(SeuratWrappers)
+library(patchwork)
+library(BPCells)
+library(presto)
+library(glmGamPoi)
+library(scater)
+library(scran)
+library(DropletUtils)
+library(sctransform)
+library(FNN)
+library(ggnewscale)
+library(bootstrap)
+library(scales)
+library(Cairo)
+library(scDblFinder)
+library(SingleCellExperiment)
+library(survival)
+library(survminer)
+library(svglite)
+library(mclust)
+library(igraph)
+library(Matrix)
+library(ape)
+library(phytools)
+library(dendextend)
+library(ComplexHeatmap)
+library(ggtree)
+library(ggrepel)
+library(beepr) #im sorry i know its annoying but i need a beep
+library(tidyverse)
+options(future.globals.maxSize = 60 * 1024^3)
+#custom functions - as above, many were not used in final paper, but some are and all were in my environment
+source(here::here("scripts", "functions.R"))
+```
+note that we use prior analyses as 'sanity checks' to inform the integration analysis, but all of the figures in this paper are produced using data processed starting from raw reads to ensure consistency in processing between atlas and culture samples. 
+```{r load data}
+#read in raw, unprocessed seurat objects
+source(here::here("scripts", "read_raw_seurat_objects.R"))
+#from original atlas publication
+#source(here::here("scripts", "pull_massri_2021_data.R"))
+AJ_atlas <- readRDS(file = here::here("objects", "Massri_data", "GSE184538_lv_umap.rds"))
+#from berrio et al 2024
+AB_atlas <- readRDS(file = here("objects", "lvar_seuratObj_alejo.rds"))
+#make numeric devtime column from sample IDs
+AB_atlas$devtime <- as.numeric(sub("hpf.*", "", AB_atlas$orig.ident))
+```
+From these plots, we determined thresholding for rRNA read percentage. the thresholds used exclude roughly the same proportion of cells for the atlas and the cultures. We aimed to exclude only very extreme values, as it is not entirely clear what the meaning of trimming high rRNA cells is in this context. Our goal was to preserve as much as possible here, with the understanding that unhealthy cells should have numerous other signatures enabling their identification later on. The field would benefit from a rigorous examination of the relationship between commonly used metrics of cell health and actual cell health in the developmental context and in echinoderms specifically. 
+
+#rRNA QC and filtering
+```{r ribosomal RNA QC}
+ribosomal_LOCs <- readLines(here::here("ribosomal_LOCs.txt"))
+
+dir.create(path = here::here("plots", "qcplots", "ribosomal_reads"), recursive = TRUE, showWarnings = FALSE)
+
+samples <- c("LV_10FBS", "Lv_10hpf", "Lv_11hpf", "Lv_12hpf", "Lv_13hpf", 
+             "Lv_14hpf", "LV_15FBS", "Lv_15hpf", "Lv_16hpf", "Lv_18hpf", 
+             "Lv_20hpf", "Lv_24hpf", "Lv_2hpf", "Lv_3hpf", "Lv_4hpf", 
+             "LV_5FBS", "Lv_5hpf", "Lv_6hpf", "Lv_7hpf", "Lv_8hpf", "Lv_9hpf")
+
+for (s in samples) {
+  message("Processing: ", s)
+  obj <- get(s)
+  obj <- annotate_percent_ribo(obj, ribosomal_LOCs)
+  assign(s, obj, envir = .GlobalEnv)
+}
+
+for (s in samples) {
+  message("Summary of Ribosomal RNA read percentage for ", s)
+  obj <- get(s)
+  print(summary(obj$percent.ribo))
+}
+
+
+#plot %rb
+# Get developmental object names
+lv_objects <- grep("^Lv_\\d+hpf$", ls(), value = TRUE)
+
+# Extract percent.ribo
+ribo_data <- do.call(rbind, lapply(lv_objects, function(objname) {
+  obj <- get(objname)
+  data.frame(
+    percent_ribo = obj$percent.ribo,
+    timepoint = objname
+  )
+}))
+
+# Order timepoints
+time_order <- c(
+  "Lv_2hpf", "Lv_3hpf", "Lv_4hpf", "Lv_5hpf", "Lv_6hpf", "Lv_7hpf", "Lv_8hpf", "Lv_9hpf",
+  "Lv_10hpf", "Lv_11hpf", "Lv_12hpf", "Lv_13hpf", "Lv_14hpf", "Lv_15hpf", "Lv_16hpf",
+  "Lv_18hpf", "Lv_20hpf", "Lv_24hpf"
+)
+ribo_data$timepoint <- factor(ribo_data$timepoint, levels = time_order)
+
+# Plot
+p <- ggplot(ribo_data, aes(x = timepoint, y = percent_ribo)) +
+  geom_violin(scale = "width", fill = "darkorange", color = "black") +
+  theme_minimal() +
+  labs(x = "Timepoint", y = "% Ribosomal Reads") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p)
+ggsave(filename = here::here("plots", "qcplots", "ribosomal_reads", "Ribo_Violin_Atlas.png"), plot = p, width = 7.5, height = 4)
+
+fbs_objects <- c("LV_5FBS", "LV_10FBS", "LV_15FBS")
+
+fbs_ribo_data <- do.call(rbind, lapply(fbs_objects, function(objname) {
+  obj <- get(objname)
+  data.frame(
+    percent_ribo = obj$percent.ribo,
+    timepoint = objname
+  )
+}))
+
+p <- ggplot(fbs_ribo_data, aes(x = timepoint, y = percent_ribo)) +
+  geom_violin(scale = "width", fill = "darkorange", color = "black") +
+  theme_minimal() +
+  labs(x = "Timepoint", y = "% Ribosomal Reads") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p)
+ggsave(filename = here::here("plots", "qcplots", "ribosomal_reads", "Ribo_FBS_Atlas.png"), plot = p, width = 4, height = 4)
+
+# Combine both dev and FBS
+dev_objects <- time_order
+ribo_data_combined <- do.call(rbind, lapply(c(fbs_objects, dev_objects), function(objname) {
+  obj <- get(objname)
+  data.frame(
+    percent_ribo = obj$percent.ribo,
+    timepoint = objname
+  )
+}))
+
+ribo_data_combined$timepoint <- factor(ribo_data_combined$timepoint, levels = c(fbs_objects, dev_objects))
+
+p <- ggplot(ribo_data_combined, aes(x = timepoint, y = percent_ribo)) +
+  geom_violin(scale = "width", fill = "darkorange", color = "black") +
+  theme_minimal() +
+  labs(x = "Timepoint", y = "% Ribosomal Reads") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p)
+ggsave(filename = here("plots", "qcplots", "ribosomal_reads", "Ribo_Violin_combined.png"), plot = p, width = 7.5, height = 4)
+
+ab_ribo_data <- data.frame(
+  percent_ribo = AB_atlas$percent.Rb,
+  timepoint = AB_atlas$orig.ident
+)
+
+# order by dev time
+ab_ribo_data$timepoint <- factor(
+  ab_ribo_data$timepoint,
+  levels = c(
+    "2hpf", "3hpf", "4hpf", "5hpf", "6hpf", "7hpf", "8hpf", "9hpf",
+    "10hpf", "11hpf", "12hpf", "13hpf", "14hpf", "15hpf", "16hpf",
+    "18hpf", "20hpf", "24hpf"
+  )
+)
+
+#plot
+p <- ggplot(ab_ribo_data, aes(x = timepoint, y = percent_ribo)) +
+  geom_violin(scale = "width", fill = "darkorange", color = "black") +
+  theme_minimal() +
+  labs(x = "Timepoint", y = "% Ribosomal Reads") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p)
+ggsave(filename = here("plots", "qcplots", "ribosomal_reads", "Ribo_Violin_AB_atlas.png"), plot = p, width = 7.5, height = 4)
+
+#dev/atlas
+dev_objects <- grep("^Lv_\\d+hpf$", ls(), value = TRUE) #pulling from environment
+for (objname in dev_objects) {
+  obj <- get(objname)
+  obj <- subset(obj, subset = percent.ribo < 30) 
+  assign(objname, obj, envir = .GlobalEnv)
+}
+
+#fbs
+fbs_objects <- c("LV_5FBS", "LV_10FBS", "LV_15FBS")
+for (objname in fbs_objects) {
+  obj <- get(objname)
+  obj <- subset(obj, subset = percent.ribo < 50) 
+  assign(objname, obj, envir = .GlobalEnv)
+}
+
+```
+
+We used the current NCBI annotations for processing data through cellranger, but LOCIDs without descriptions are a pain. For convenience, we transferred annotations from another analysis; we provide them here for convenience, but caution that they are not perfect. For each plotted LOCID in the paper, we therefore have checked the identity we assign to that LOCID by hand and verified identity via tBLASATn to several closely related species. 
+
+#annotation translation for convenience
+```{r translating LOCIDs for convenience}
+# Import gene common name identifiers
+loc_map <- read_csv("loc_map.csv") #Caution - these should be viewed as a convenience feature. Verify identity of LOCIDs if you use this. 
+loc_map <- setNames(loc_map$LOC_with_putative_gene_name, loc_map$LOCID)
+
+# Function to remap gene (row) names
+add_gene_names_to_rownames <- function(seurat_obj, loc_map) {
+  old_ids <- rownames(seurat_obj@assays$RNA)
+  new_ids <- ifelse(old_ids %in% names(loc_map), loc_map[old_ids], old_ids)
+  new_obj <- seurat_obj
+  rownames(new_obj@assays$RNA) <- new_ids
+  return(new_obj)
+}
+
+# Apply to a few objects for testing
+LV_10FBS_named <- add_gene_names_to_rownames(LV_10FBS, loc_map)
+Lv_10hpf_named <- add_gene_names_to_rownames(Lv_10hpf, loc_map)
+
+
+#sanity check time
+#Extract counts/data matrices from both original and renamed 
+original_counts <- LayerData(LV_10FBS, layer = "counts")
+named_counts    <- LayerData(LV_10FBS_named, layer = "counts")
+
+original_data <- LayerData(LV_10FBS, layer = "data")
+named_data    <- LayerData(LV_10FBS_named, layer = "data")
+
+#Extract counts/data matrices from both original and renamed
+original_counts <- LayerData(LV_10FBS, layer = "counts")
+named_counts    <- LayerData(LV_10FBS_named, layer = "counts")
+
+original_data <- LayerData(LV_10FBS, layer = "data")
+named_data    <- LayerData(LV_10FBS_named, layer = "data")
+
+# Compare without rownames
+cat("Counts equal (excluding rownames):", identical(unname(original_counts), unname(named_counts)), "\n")
+cat("Data equal (excluding rownames):", identical(unname(original_data), unname(named_data)), "\n")
+
+# Compare dimension and rowname consistency
+cat("Same number of features:", nrow(original_counts) == nrow(named_counts), "\n")
+
+# Compare LOC IDs (ignoring suffix)
+original_ids <- rownames(original_counts)
+named_ids <- sub(":[^:]*$", "", rownames(named_counts))  # Strip appended info
+
+cat("Same LOC IDs (order preserved):", identical(original_ids, named_ids), "\n")
+
+#this worked. extend to other objects. remove "_named" objects. 
+LV_10FBS <- add_gene_names_to_rownames(LV_10FBS, loc_map)
+LV_15FBS <- add_gene_names_to_rownames(LV_15FBS, loc_map)
+LV_5FBS  <- add_gene_names_to_rownames(LV_5FBS,  loc_map)
+
+Lv_10hpf <- add_gene_names_to_rownames(Lv_10hpf, loc_map)
+Lv_11hpf <- add_gene_names_to_rownames(Lv_11hpf, loc_map)
+Lv_12hpf <- add_gene_names_to_rownames(Lv_12hpf, loc_map)
+Lv_13hpf <- add_gene_names_to_rownames(Lv_13hpf, loc_map)
+Lv_14hpf <- add_gene_names_to_rownames(Lv_14hpf, loc_map)
+Lv_15hpf <- add_gene_names_to_rownames(Lv_15hpf, loc_map)
+Lv_16hpf <- add_gene_names_to_rownames(Lv_16hpf, loc_map)
+Lv_18hpf <- add_gene_names_to_rownames(Lv_18hpf, loc_map)
+Lv_20hpf <- add_gene_names_to_rownames(Lv_20hpf, loc_map)
+Lv_24hpf <- add_gene_names_to_rownames(Lv_24hpf, loc_map)
+Lv_2hpf  <- add_gene_names_to_rownames(Lv_2hpf,  loc_map)
+Lv_3hpf  <- add_gene_names_to_rownames(Lv_3hpf,  loc_map)
+Lv_4hpf  <- add_gene_names_to_rownames(Lv_4hpf,  loc_map)
+Lv_5hpf  <- add_gene_names_to_rownames(Lv_5hpf,  loc_map)
+Lv_6hpf  <- add_gene_names_to_rownames(Lv_6hpf,  loc_map)
+Lv_7hpf  <- add_gene_names_to_rownames(Lv_7hpf,  loc_map)
+Lv_8hpf  <- add_gene_names_to_rownames(Lv_8hpf,  loc_map)
+Lv_9hpf  <- add_gene_names_to_rownames(Lv_9hpf,  loc_map)
+# cleanup
+rm(LV_10FBS_named, Lv_10hpf_named)
+
+```
+
+
+#mitochondrial read percentage filtering and plotting
+check all mt read percentages in all samples
+
+```{r dig into mt.percentage more}
+#actually, lets check them all
+
+lv_objects <- c(
+  "Lv_2hpf", "Lv_3hpf", "Lv_4hpf", "Lv_5hpf", "Lv_6hpf", "Lv_7hpf",
+  "Lv_8hpf", "Lv_9hpf", "Lv_10hpf", "Lv_11hpf", "Lv_12hpf", "Lv_13hpf",
+  "Lv_14hpf", "Lv_15hpf", "Lv_16hpf", "Lv_18hpf", "Lv_20hpf", "Lv_24hpf"
+)
+
+# Build table of unmatched barcode counts + mt exclusion per timepoint
+cell_diff_df <- data.frame(
+  timepoint = lv_objects,
+  not_in_AB = sapply(lv_objects, function(objname) {
+    tp <- sub("Lv_", "", objname)
+    ab_barcodes <- colnames(AB_atlas)[AB_atlas$orig.ident == tp]
+    ab_stripped <- gsub("^\\d+hpf_|\\.1$", "", ab_barcodes)
+    lv_barcodes <- gsub("-1$", "", colnames(get(objname)))
+    sum(!lv_barcodes %in% ab_stripped)
+  }),
+  mt_excluded = sapply(lv_objects, function(objname) {
+    obj <- get(objname)
+    tp <- sub("Lv_", "", objname)
+    ab_barcodes <- colnames(AB_atlas)[AB_atlas$orig.ident == tp]
+    ab_stripped <- gsub("^\\d+hpf_|\\.1$", "", ab_barcodes)
+    lv_barcodes <- gsub("-1$", "", colnames(obj))
+    unmatched <- setdiff(lv_barcodes, ab_stripped)
+    sum(gsub("-1$", "", colnames(obj)) %in% unmatched & obj$percent.mt > 40)
+  })
+)
+
+# Prepare long-format data for stacking
+plot_df <- rbind(
+  data.frame(timepoint = cell_diff_df$timepoint, count = cell_diff_df$mt_excluded, reason = "percent.mt > 40"),
+  data.frame(timepoint = cell_diff_df$timepoint,
+             count = cell_diff_df$not_in_AB - cell_diff_df$mt_excluded,
+             reason = "other")
+)
+
+plot_df$timepoint <- factor(plot_df$timepoint, levels = lv_objects)
+
+# Plot
+p <- ggplot(plot_df, aes(x = timepoint, y = count, fill = reason)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("percent.mt > 40" = "tomato", "other" = "steelblue")) +
+  labs(
+    title = "Excluded Cells per Timepoint in Lv_xhpf vs AB_atlas",
+    x = "Timepoint",
+    y = "Number of Excluded Cells",
+    fill = "Exclusion Reason"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p)
+dir.create(path = here::here("plots", "qcplots", "sanity_checks"), recursive = TRUE, showWarnings = FALSE)
+ggsave(filename = here::here("plots", "qcplots", "sanity_checks", "cell_exclusion_by_time.png"), plot = p, width = 7.5, height = 4)
+
+
+#plot percentage mt reads as violins in all single time point objects (starting with LV_ or Lv_)
+# Define timepoint objects to include (exclude FBS)
+lv_objects <- grep("^Lv_\\d+hpf$", ls(), value = TRUE)
+
+# Create a combined dataframe with percent.mt and timepoint labels
+mt_data <- do.call(rbind, lapply(lv_objects, function(objname) {
+  obj <- get(objname)
+  data.frame(
+    percent_mt = obj$percent.mt,
+    timepoint = objname
+  )
+}))
+
+time_order <- c(
+  "Lv_2hpf", "Lv_3hpf", "Lv_4hpf", "Lv_5hpf", "Lv_6hpf", "Lv_7hpf", "Lv_8hpf", "Lv_9hpf",
+  "Lv_10hpf", "Lv_11hpf", "Lv_12hpf", "Lv_13hpf", "Lv_14hpf", "Lv_15hpf", "Lv_16hpf",
+  "Lv_18hpf", "Lv_20hpf", "Lv_24hpf"
+)
+
+# Update factor levels
+mt_data$timepoint <- factor(mt_data$timepoint, levels = time_order)
+
+#create directory for plots
+
+# Redraw plot
+p <- ggplot(mt_data, aes(x = timepoint, y = percent_mt)) +
+  geom_violin(scale = "width", fill = "steelblue", color = "black") +
+  geom_hline(yintercept = 40, color = "red", linetype = "dashed", linewidth = 0.8) +
+  theme_minimal() +
+  labs(x = "Timepoint", y = "% Mitochondrial Reads") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p)
+ggsave(filename = here::here("plots", "qcplots", "mitochondrial_reads", "MT_Violin_Atlas.png"), plot = p, width = 7.5, height = 4)
+#same, but for cultured
+
+# Define FBS object names
+fbs_objects <- c("LV_5FBS", "LV_10FBS", "LV_15FBS")
+
+# Create data frame
+fbs_mt_data <- do.call(rbind, lapply(fbs_objects, function(objname) {
+  obj <- get(objname)
+  data.frame(
+    percent_mt = obj$percent.mt,
+    timepoint = objname
+  )
+}))
+
+# Plot
+p <- ggplot(fbs_mt_data, aes(x = timepoint, y = percent_mt)) +
+  geom_violin(scale = "width", fill = "steelblue", color = "black") +
+  geom_hline(yintercept = 40, color = "red", linetype = "dashed", linewidth = 0.8) +
+  theme_minimal() +
+  labs(x = "Timepoint", y = "% Mitochondrial Reads") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p)
+ggsave(filename = here::here("plots", "qcplots", "mitochondrial_reads", "MT_FBS_Atlas.png"), plot = p, width = 4, height = 4)
+
+#combine
+# Define FBS and developmental sample object names
+fbs_objects <- c("LV_5FBS", "LV_10FBS", "LV_15FBS")
+dev_objects <- c(
+  "Lv_2hpf", "Lv_3hpf", "Lv_4hpf", "Lv_5hpf", "Lv_6hpf", "Lv_7hpf",
+  "Lv_8hpf", "Lv_9hpf", "Lv_10hpf", "Lv_11hpf", "Lv_12hpf", "Lv_13hpf",
+  "Lv_14hpf", "Lv_15hpf", "Lv_16hpf", "Lv_18hpf", "Lv_20hpf", "Lv_24hpf"
+)
+
+# Extract data for both groups
+mt_data_combined <- do.call(rbind, lapply(c(fbs_objects, dev_objects), function(objname) {
+  obj <- get(objname)
+  data.frame(
+    percent_mt = obj$percent.mt,
+    timepoint = objname
+  )
+}))
+
+# Set factor levels to get desired order in plot
+mt_data_combined$timepoint <- factor(mt_data_combined$timepoint, levels = c(fbs_objects, dev_objects))
+
+# Combined violin plot
+p <- ggplot(mt_data_combined, aes(x = timepoint, y = percent_mt)) +
+  geom_violin(scale = "width", fill = "steelblue", color = "black") +
+  geom_hline(yintercept = 40, color = "orange", linetype = "dashed", linewidth = 0.8) +
+  geom_hline(yintercept = 62.5, color = "red", linetype = "dashed", linewidth = 0.8) +
+  theme_minimal() +
+  labs(x = "Timepoint", y = "% Mitochondrial Reads") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  ylim(c(0,100))
+print(p)
+ggsave(filename = here::here("plots", "qcplots", "mitochondrial_reads", "MT_Violin_combined.png"), plot = p, width = 7.5, height = 4)
+```
+
+#filter on mtRNA read percentage
+now finally filtering mt reads based on what I saw in analysis above and advice from greg. I am unconvinced that high mtRNA is representative of a 'sick' cell in this context. it is almost certainly a reflection of cytoplasmic volume and high number of mitochondria in egg. Distribution suggests dilution of mitochondria as cleavages progress. 
+```{r filter mt reads}
+#filter on % MT reads
+
+Lv_2hpf <- subset(Lv_2hpf, subset = percent.mt <= 62.5)
+Lv_3hpf <- subset(Lv_3hpf, subset = percent.mt <= 62.5)
+Lv_4hpf <- subset(Lv_4hpf, subset = percent.mt <= 62.5)
+Lv_5hpf <- subset(Lv_5hpf, subset = percent.mt <= 62.5)
+Lv_6hpf <- subset(Lv_6hpf, subset = percent.mt <= 62.5)
+
+Lv_7hpf <- subset(Lv_7hpf, subset = percent.mt <= 40)
+Lv_8hpf <- subset(Lv_8hpf, subset = percent.mt <= 40)
+Lv_9hpf <- subset(Lv_9hpf, subset = percent.mt <= 40)
+Lv_10hpf <- subset(Lv_10hpf, subset = percent.mt <= 40)
+Lv_11hpf <- subset(Lv_11hpf, subset = percent.mt <= 40)
+Lv_12hpf <- subset(Lv_12hpf, subset = percent.mt <= 40)
+Lv_13hpf <- subset(Lv_13hpf, subset = percent.mt <= 40)
+Lv_14hpf <- subset(Lv_14hpf, subset = percent.mt <= 40)
+Lv_15hpf <- subset(Lv_15hpf, subset = percent.mt <= 40)
+Lv_16hpf <- subset(Lv_16hpf, subset = percent.mt <= 40)
+Lv_18hpf <- subset(Lv_18hpf, subset = percent.mt <= 40)
+Lv_20hpf <- subset(Lv_20hpf, subset = percent.mt <= 40)
+Lv_24hpf <- subset(Lv_24hpf, subset = percent.mt <= 40)
+
+LV_5FBS <- subset(LV_5FBS, subset = percent.mt <= 40)
+LV_10FBS <- subset(LV_10FBS, subset = percent.mt <= 40)
+LV_15FBS <- subset(LV_15FBS, subset = percent.mt <= 40)
+```
+
+#add numeric devtime field
+I dont want to be continually refactoring when I plot, and the developmental time/stage is inherently numeric (2/6/12 hpf etc), so I am going to make that explicit. 
+```{r make devtime numeric}
+#add numerical devtime metadata so i can quit with the refactoring
+# Get all relevant object names
+lv_object_names <- ls(pattern = "^(Lv_|LV_)")
+
+# Assign devtime metadata
+for (objname in lv_object_names) {
+  obj <- get(objname)
+  # Extract time from object name (e.g., 2 from Lv_2hpf)
+  time_match <- sub(".*_(\\d+)hpf$", "\\1", objname)
+  if (grepl("^\\d+$", time_match)) {
+    obj$devtime <- as.numeric(time_match)
+  } else {
+    obj$devtime <- NA  # FBS samples or malformed names
+  }
+  
+  assign(objname, obj, envir = .GlobalEnv)
+}
+```
+
+#make colnames consistent
+```{r make colnames consistent}
+
+Lv_2hpf  <- RenameCells(Lv_2hpf,  new.names = paste0("2hpf_",  gsub("-1$", "", colnames(Lv_2hpf)),  ".1"))
+Lv_3hpf  <- RenameCells(Lv_3hpf,  new.names = paste0("3hpf_",  gsub("-1$", "", colnames(Lv_3hpf)),  ".1"))
+Lv_4hpf  <- RenameCells(Lv_4hpf,  new.names = paste0("4hpf_",  gsub("-1$", "", colnames(Lv_4hpf)),  ".1"))
+Lv_5hpf  <- RenameCells(Lv_5hpf,  new.names = paste0("5hpf_",  gsub("-1$", "", colnames(Lv_5hpf)),  ".1"))
+Lv_6hpf  <- RenameCells(Lv_6hpf,  new.names = paste0("6hpf_",  gsub("-1$", "", colnames(Lv_6hpf)),  ".1"))
+Lv_7hpf  <- RenameCells(Lv_7hpf,  new.names = paste0("7hpf_",  gsub("-1$", "", colnames(Lv_7hpf)),  ".1"))
+Lv_8hpf  <- RenameCells(Lv_8hpf,  new.names = paste0("8hpf_",  gsub("-1$", "", colnames(Lv_8hpf)),  ".1"))
+Lv_9hpf  <- RenameCells(Lv_9hpf,  new.names = paste0("9hpf_",  gsub("-1$", "", colnames(Lv_9hpf)),  ".1"))
+Lv_10hpf <- RenameCells(Lv_10hpf, new.names = paste0("10hpf_", gsub("-1$", "", colnames(Lv_10hpf)), ".1"))
+Lv_11hpf <- RenameCells(Lv_11hpf, new.names = paste0("11hpf_", gsub("-1$", "", colnames(Lv_11hpf)), ".1"))
+Lv_12hpf <- RenameCells(Lv_12hpf, new.names = paste0("12hpf_", gsub("-1$", "", colnames(Lv_12hpf)), ".1"))
+Lv_13hpf <- RenameCells(Lv_13hpf, new.names = paste0("13hpf_", gsub("-1$", "", colnames(Lv_13hpf)), ".1"))
+Lv_14hpf <- RenameCells(Lv_14hpf, new.names = paste0("14hpf_", gsub("-1$", "", colnames(Lv_14hpf)), ".1"))
+Lv_15hpf <- RenameCells(Lv_15hpf, new.names = paste0("15hpf_", gsub("-1$", "", colnames(Lv_15hpf)), ".1"))
+Lv_16hpf <- RenameCells(Lv_16hpf, new.names = paste0("16hpf_", gsub("-1$", "", colnames(Lv_16hpf)), ".1"))
+Lv_18hpf <- RenameCells(Lv_18hpf, new.names = paste0("18hpf_", gsub("-1$", "", colnames(Lv_18hpf)), ".1"))
+Lv_20hpf <- RenameCells(Lv_20hpf, new.names = paste0("20hpf_", gsub("-1$", "", colnames(Lv_20hpf)), ".1"))
+Lv_24hpf <- RenameCells(Lv_24hpf, new.names = paste0("24hpf_", gsub("-1$", "", colnames(Lv_24hpf)), ".1"))
+```
+
+#prep for doublet filtration
+prepare to filter doublets by running default seurat pipeline (run each sample separately). This takes a while to run. 
+```{r per-sample basic seurat SCT pipeline ahead of doublet filtration, message=FALSE, warning=TRUE}
+#create output directory explicitly
+dir.create(here::here("plots", "qcplots", "elbowplots", "persampleelbows"), recursive = TRUE, showWarnings = FALSE)
+
+#list samples
+sample_names <- c(
+  "Lv_2hpf", "Lv_3hpf", "Lv_4hpf", "Lv_5hpf", "Lv_6hpf", "Lv_7hpf",
+  "Lv_8hpf", "Lv_9hpf", "Lv_10hpf", "Lv_11hpf", "Lv_12hpf", "Lv_13hpf",
+  "Lv_14hpf", "Lv_15hpf", "Lv_16hpf", "Lv_18hpf", "Lv_20hpf", "Lv_24hpf",
+  "LV_5FBS", "LV_10FBS", "LV_15FBS"
+)
+
+#run seurat pipeline explicitly
+for (objname in sample_names) {
+  message("processing: ", objname)
+  obj <- get(objname)
+
+  #run standard Seurat SCT pipeline
+  obj <- SCTransform(obj, vars.to.regress = c("percent.ribo", "percent.mt"))
+  obj <- RunPCA(obj)
+
+  #elbow plot after PCA
+  ggsave(
+    ElbowPlot(obj) + ggtitle(paste0(objname, " Elbow Plot")),
+    filename = here::here("plots", "qcplots", "elbowplots", "persampleelbows", paste0(objname, "_elbowplot.png")),
+    width = 6, height = 4
+  )
+
+  obj <- FindNeighbors(obj, dims = 1:30)
+  obj <- FindClusters(obj)
+  obj <- RunUMAP(obj, dims = 1:30)
+
+  #assign back to global environment
+  assign(objname, obj, envir = .GlobalEnv)
+
+  message("completed: ", objname)
+}
+#beep to notify when done
+beep(sound = 4)
+Sys.sleep(time = 1) #allow beep to play before proceeding to next chunk
+```
+
+#find doublets
+note: Lab has used DoubletFinder in the past but I had a lot of trouble with it. it appears that it is not as well maintained as bioconductor's scDblFinder. I tested this pretty extensively because doubletfinder was such a struggle. 
+This step is computationally expensive. It takes a long time and the number of doublets found is relatively low. 
+```{r doublet filter, message=FALSE, warning=TRUE}
+# define sample list
+sample_names <- c(
+  "Lv_2hpf", "Lv_3hpf", "Lv_4hpf", "Lv_5hpf", "Lv_6hpf", "Lv_7hpf",
+  "Lv_8hpf", "Lv_9hpf", "Lv_10hpf", "Lv_11hpf", "Lv_12hpf", "Lv_13hpf",
+  "Lv_14hpf", "Lv_15hpf", "Lv_16hpf", "Lv_18hpf", "Lv_20hpf", "Lv_24hpf",
+  "LV_5FBS", "LV_10FBS", "LV_15FBS"
+)
+
+# initialize summary table
+dbl_summary <- data.frame(
+  sample = character(),
+  n_total = integer(),
+  n_singlet = integer(),
+  n_doublet = integer(),
+  prop_singlet = numeric()
+)
+
+# run scDblFinder on each object and store results directly in metadata
+for (objname in sample_names) {
+  message("Running scDblFinder on ", objname)
+  obj <- get(objname)
+
+  sce <- as.SingleCellExperiment(obj, assay = "SCT")
+  sce <- scDblFinder(sce)
+
+  # mutate metadata
+  obj$scDblFinder.class <- sce$scDblFinder.class
+  obj$scDblFinder.score <- sce$scDblFinder.score
+
+  assign(objname, obj, envir = .GlobalEnv)
+}
+
+# get seurat objects from samplenames
+sl <- mget(sample_names)
+
+# summarize results in table
+dbl_summary <- do.call(rbind, lapply(names(sl), function(objname) {
+  obj <- sl[[objname]]
+  n_total <- ncol(obj)
+  n_singlet <- sum(obj$scDblFinder.class == "singlet")
+  n_doublet <- sum(obj$scDblFinder.class == "doublet")
+  prop_singlet <- round(n_singlet / n_total, 3)
+
+  message("**  ", objname, ": ", n_singlet, "/", n_total, " singlets (", 100 * prop_singlet, "%)")
+
+  data.frame(
+    sample = objname,
+    n_total = n_total,
+    n_singlet = n_singlet,
+    n_doublet = n_doublet,
+    prop_singlet = prop_singlet
+  )
+}))
+
+# write to CSV
+write.csv(
+  dbl_summary,
+  here::here("plots", "qcplots", "scDblFinderPlots", "doublet_summary.csv"),
+  row.names = FALSE
+)
+
+# build per-cell metadata table for plotting
+dbl_long <- do.call(rbind, lapply(names(sl), function(objname) {
+  obj <- sl[[objname]]
+  data.frame(
+    sample = objname,
+    cell = colnames(obj),
+    nCount_RNA = obj$nCount_RNA,
+    nFeature_RNA = obj$nFeature_RNA,
+    scDblFinder.class = obj$scDblFinder.class,
+    devtime = obj$devtime,
+    samplesource = obj$samplesource,
+    stringsAsFactors = FALSE
+  )
+
+}))
+```
+
+#plot doublet rates 
+plot doublet rates and see if anything is interesting. 
+```{r plot doublet stats}
+# violin of nCount_RNA with singlets as violins and doublets as points
+p <- ggplot(dbl_long, aes(x = sample, y = nCount_RNA)) +
+  geom_violin(data = filter(dbl_long, scDblFinder.class == "singlet"),
+              aes(fill = scDblFinder.class),
+              scale = "width", color = "black") +
+  geom_jitter(data = filter(dbl_long, scDblFinder.class == "doublet"),
+              aes(color = scDblFinder.class),
+              alpha = 0.3, width = 0.25, size = 0.6) +
+  scale_fill_manual(values = c("singlet" = "gray80")) +
+  scale_color_manual(values = c("doublet" = "red")) +
+  theme_minimal() +
+  labs(x = "Sample", y = "nCount_RNA") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p)
+ggsave(
+  filename = here::here("plots", "qcplots", "scDblFinderPlots", "nCountRNA_violin_by_sample.pdf"), plot = p, width = 9, height = 4)
+
+p <- ggplot(dbl_summary, aes(x = sample, y = 1 - prop_singlet)) +
+  geom_bar(stat = "identity", fill = "tomato") +
+  theme_minimal() +
+  labs(
+    x = "Sample",
+    y = "Doublet Rate",
+    title = "Doublet Rate per Sample"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p)
+ggsave(
+  filename = here::here("plots", "qcplots", "scDblFinderPlots", "doublet_rate_barplot.pdf"), plot = p, 
+  width = 8, height = 4
+)
+
+p <- ggplot(dbl_long, aes(x = samplesource, y = as.numeric(scDblFinder.class == "doublet"))) +
+  geom_boxplot(outlier.shape = NA, fill = "steelblue") +
+  geom_jitter(width = 0.2, alpha = 0.2, size = 0.4) +
+  labs(x = "Sample Source", y = "Doublet Indicator", title = "Doublet Rate by Sample Source") +
+  theme_minimal()
+print(p)
+ggsave(
+  filename = here::here("plots", "qcplots", "scDblFinderPlots", "doublet_rate_by_source_boxplot.pdf"), plot = p,
+  width = 4, height = 4
+)
+
+p <- ggplot(dbl_long, aes(x = sample, y = nFeature_RNA)) +
+  geom_violin(data = filter(dbl_long, scDblFinder.class == "singlet"),
+              aes(fill = scDblFinder.class),
+              scale = "width", color = "black") +
+  geom_jitter(data = filter(dbl_long, scDblFinder.class == "doublet"),
+              aes(color = scDblFinder.class),
+              alpha = 0.3, width = 0.25, size = 0.6) +
+  scale_fill_manual(values = c("singlet" = "gray80")) +
+  scale_color_manual(values = c("doublet" = "red")) +
+  theme_minimal() +
+  labs(x = "Sample", y = "nFeature_RNA") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p)
+ggsave(
+  filename = here::here("plots", "qcplots", "scDblFinderPlots", "nFeatureRNA_violin_by_sample.pdf"), plot = p, 
+  width = 9, height = 4
+)
+
+# summarize doublet rate by samplesource
+dbl_by_source <- dbl_long %>%
+  group_by(samplesource) %>%
+  summarize(
+    prop_doublet = mean(scDblFinder.class == "doublet"),
+    se = sd(scDblFinder.class == "doublet") / sqrt(n()),
+    .groups = "drop"
+  )
+
+# plot with 95% CI
+p <- ggplot(dbl_by_source, aes(x = samplesource, y = prop_doublet, fill = samplesource)) +
+  geom_col(width = 0.6, color = "black") +
+  geom_errorbar(aes(ymin = prop_doublet - 1.96 * se, ymax = prop_doublet + 1.96 * se),
+                width = 0.2) +
+  labs(x = "Sample Source", y = "Proportion Doublets", title = "Mean Doublet Rate by Sample Source") +
+  scale_fill_manual(values = c("atlas" = "salmon", "culture" = "skyblue")) +
+  theme_minimal() +
+  theme(legend.position = "none")
+print(p)
+ggsave(
+  filename = here::here("plots", "qcplots", "scDblFinderPlots", "doublet_cols_with_CI.pdf"), plot = p, 
+  width = 9, height = 4
+)
+```
+
+#filter doublets out
+```{r doublet filtration}
+# filter to singlets and overwrite each object
+for (objname in sample_names) {
+  obj <- get(objname)
+  singlets <- subset(obj, subset = scDblFinder.class == "singlet")
+  assign(objname, singlets, envir = .GlobalEnv)
+}
+
+# update sl with filtered singlets
+sl <- mget(sample_names)
+```
+
+#save individual filtered objects
+This takes a little while to run. beep to indicate completion
+```{r save filtered objects}
+# create output directory
+dir.create(here::here("objects", "filtered_individual_mt-rb-dbls"), recursive = TRUE, showWarnings = FALSE)
+
+# save each object as RDS
+for (objname in sample_names) {
+  obj <- get(objname)
+  saveRDS(
+    obj,
+    here::here("objects", "filtered_individual_mt-rb-dbls", paste0(objname, ".rds"))
+  )
+}
+
+#beep to notify when done
+beep(sound = 4)
+Sys.sleep(time = 1) #allow beep to play before proceeding to next chunk
+
+```
+
+#full seurat pipeline separately for cultures/atlas
+This takes a little while to run. beep to indicate completion
+commented out code explored 
+```{r SCTransform and basic seurat pipeline - unintegrated}
+#merge individual samples
+#drop SCT assays
+for (s in sl) {
+  DefaultAssay(s) <- "RNA"
+  if ("SCT" %in% names(s@assays)) {
+    s[["SCT"]] <- NULL
+  }
+}
+#reassign 
+list2env(setNames(sl, names(sl)), envir = .GlobalEnv)
+#atlas merge
+atlas_full <- merge(
+  Lv_2hpf, y = c(
+    Lv_3hpf, Lv_4hpf, Lv_5hpf, Lv_6hpf, Lv_7hpf, Lv_8hpf,
+    Lv_9hpf, Lv_10hpf, Lv_11hpf, Lv_12hpf, Lv_13hpf, Lv_14hpf,
+    Lv_15hpf, Lv_16hpf, Lv_18hpf, Lv_20hpf, Lv_24hpf
+  ))
+
+DefaultAssay(atlas_full) <- "RNA"
+atlas_full@assays$SCT <- NULL
+atlas_full <- atlas_full %>% JoinLayers() #critical - otherwise you get individual sct assays per sample
+
+atlas_full <- atlas_full %>% 
+  SCTransform(vars.to.regress = c("percent.mt", "percent.ribo"), verbose = TRUE) %>% 
+  RunPCA(verbose = TRUE)
+
+p <- ElbowPlot(atlas_full, ndims = 50) 
+print(p)
+ggsave(filename = here::here("plots", "qcplots", "elbowplots", "atlas_elbowplot_flattened.png"), plot = p, width = 5, height = 5)
+
+atlas_full <- atlas_full %>% 
+  RunUMAP(dims = 1:30, 
+          reduction = "pca", 
+          n.components = 3L, 
+          min.dist = 0.3, 
+          reduction.name = "umap3D", 
+          reduction.key = "umap3D_", 
+          return.model = TRUE, # must return model to use mapquery later
+          seed.use = 42) %>% 
+  RunUMAP(dims = 1:30, 
+          reduction = "pca", 
+          n.components = 2L, 
+          min.dist = 0.4, 
+          n.neighbors = 80, 
+          reduction.name = "umap2D", 
+          reduction.key = "umap2D_", 
+          return.model = TRUE, 
+          seed.use = 42) %>% 
+  FindNeighbors(dims = 1:30, verbose = TRUE) %>%
+  FindClusters(resolution = 0.8, verbose = TRUE, cluster.name = "unintegrated_atlas_clusters0.8") %>% 
+  FindClusters(resolution = 1, verbose = TRUE, cluster.name = "unintegrated_atlas_clusters1")
+
+saveRDS(object = atlas_full, file = here::here("objects", "unintegrated_seurat_objects", "lv_atlas_flat_sct_nodownsample.rds"))
+
+##########     same unintegrated analysis for cultures      ##########
+
+
+# prepend orig.ident (with lowercase 'v') to colnames of each culture object
+for (objname in c("LV_5FBS", "LV_10FBS", "LV_15FBS")) {
+  obj <- get(objname)
+  new_ident <- sub("^LV", "Lv", unique(obj$orig.ident)) # make 'v' lowercase for consistency
+  new_names <- paste0(new_ident, "_", colnames(obj))
+  obj <- RenameCells(obj, new.names = new_names)
+  obj$orig.ident <- new_ident
+  assign(objname, obj, envir = .GlobalEnv)
+}
+
+#smush
+cc <- merge(
+  LV_5FBS, y = c(LV_10FBS, LV_15FBS),
+  project = "Lv_cultures")
+
+#strip
+DefaultAssay(cc) <- "RNA"
+cc@assays$SCT <- NULL
+
+#flatten
+cc <- cc %>% JoinLayers() #this flattening step is critical
+
+cc <- cc %>% SCTransform(vars.to.regress = "percent.mt", verbose = TRUE) #run sct
+names(atlas[["SCT"]]@SCTModel.list) #check that this returns a single model
+
+cc <- cc %>%  RunPCA(verbose = TRUE)
+
+#output and save elbow plot
+p <- ElbowPlot(cc, ndims = 50) 
+print(p)
+ggsave(filename = here::here("plots", "qcplots", "elbowplots", "cultures_elbowplot_flattened.png"), plot = p, width = 5, height = 5)
+
+cc <- cc %>%  RunUMAP(dims = 1:30, 
+                            reduction = "pca", 
+                            n.components = 3L, 
+                            min.dist = 0.3, 
+                            reduction.name = "umap3D", 
+                            reduction.key = "umap3D_", 
+                            return.model = TRUE, 
+                            seed.use = 42) %>%
+              RunUMAP(dims = 1:30, 
+                      reduction = "pca", 
+                      n.components = 2L, 
+                      min.dist = 0.4, 
+                      n.neighbors = 80,
+                      reduction.name = "umap2D", 
+                      reduction.key = "umap2D_", 
+                      return.model = TRUE, 
+                      seed.use = 42) %>%
+              FindNeighbors(dims = 1:30, verbose = TRUE) %>%
+              FindClusters(resolution = 0.8, verbose = TRUE, cluster.name = "unintegrated_cc_clusters0.8") %>%
+              FindClusters(resolution = 1, verbose = TRUE, cluster.name = "unintegrated_cc_clusters1")
+
+
+#cleanup unneeded objects
+rm(
+  LV_10FBS,  Lv_10hpf, Lv_11hpf, Lv_12hpf, 
+  Lv_13hpf, Lv_14hpf, LV_15FBS, Lv_15hpf, 
+  Lv_16hpf, Lv_18hpf, Lv_20hpf, Lv_24hpf, 
+  Lv_2hpf, Lv_3hpf, Lv_4hpf, LV_5FBS, 
+  Lv_5hpf, Lv_6hpf, Lv_7hpf, Lv_8hpf, Lv_9hpf,
+  Lv_2hpf_AB, Lv_3hpf_AB, Lv_4hpf_AB, Lv_5hpf_AB, Lv_6hpf_AB,
+  Lv_7hpf_AB, Lv_8hpf_AB, Lv_9hpf_AB, Lv_10hpf_AB, Lv_11hpf_AB,
+  Lv_12hpf_AB, Lv_13hpf_AB, Lv_14hpf_AB, Lv_15hpf_AB, Lv_16hpf_AB,
+  Lv_18hpf_AB, Lv_20hpf_AB, Lv_24hpf_AB
+)
+
+#write out seurat objects for picking up later
+saveRDS(object = atlas_full, file = here::here("objects", "unintegrated_seurat_objects", "lv_atlas_flat_sct.rds"))
+saveRDS(object = cc, file = here::here("objects", "unintegrated_seurat_objects",  "lv_cultures_flat_sct.rds"))
+```
+
+#mapquery embedding transfer to cc from atlas_full (projecting cells from CC onto atlas umap manifold)
+```{r query-ref mapping cc-to-atlas_full}
+#find transfer anchors to project cc onto atlas_full
+anchors_cc_to_atlasfull <- FindTransferAnchors(
+  reference = atlas_full,
+  query = cc,
+  normalization.method = "SCT",
+  reference.assay = "SCT",
+  query.assay = "SCT",
+  reference.reduction = "pca"
+)
+saveRDS(anchors_cc_to_atlasfull, file = here::here("objects", "projection_outputs", "anchors_cc_to_atlasfull.rds"))
+
+#map cc onto atlas_full
+cc_mapped_atlasfull <- MapQuery(
+  anchorset = anchors_cc_to_atlasfull,
+  query = cc,
+  reference = atlas_full,
+  reference.reduction = "pca",
+  reduction.model = "umap3D",
+  verbose = TRUE
+)
+
+#save updated object
+#deleted save command bc of cstack overflow error
+#wont save because of cstack overflow. mapquery can sometimes create pretty intensely recursive structures, particularly in the neighbors field. Cant expand cstack past 8mb on mac. transfer embedding to cc instead and save cc. inconvenient but not a problem - only need embeddings
+
+#transfer ref.umap reduction
+cc@reductions$ref.umap.atlasfull <- cc_mapped_atlasfull@reductions$ref.umap
+
+#check it transferred 
+Embeddings(cc, reduction = "ref.umap.atlasfull") %>% head() # should not be NULL
+
+#save cc
+saveRDS(cc, file = here::here("objects", "projection_outputs", "cc_with_atlasfull_ref_umap.rds"))
+```
+
+
+##lvint_full save
+#integrate atlas_full and cc
+```{r integrate atlas_full with cc}
+# setup and double check that these objects are ready for integration
+features <- SelectIntegrationFeatures(list(atlas_full, cc), nfeatures = 3000)
+VariableFeatures(atlas_full) <- features
+VariableFeatures(cc) <- features
+
+DefaultAssay(atlas_full) <- "SCT"
+DefaultAssay(cc) <- "SCT"
+
+Layers(atlas_full[["SCT"]])
+Layers(cc[["SCT"]])
+
+validObject(atlas_full)
+validObject(cc)
+gc() #memory demands starting to get large here and threaten to spill into vmem and take forever. gc() here and below to minimize the pain. 
+
+# coercion to standard SCTAssay class
+atlas_full[["SCT"]] <- as(atlas_full[["SCT"]], Class = "SCTAssay")
+cc[["SCT"]]         <- as(cc[["SCT"]], Class = "SCTAssay")
+
+
+# prepare for SCT integration
+objs_prep <- PrepSCTIntegration(
+  object.list = list(atlas_full, cc),
+  anchor.features = features,
+  assay = rep("SCT", 2)
+)
+
+# find integration anchors
+anchors <- FindIntegrationAnchors(
+  object.list = objs_prep,
+  normalization.method = "SCT",
+  anchor.features = features,
+  reduction = "rpca",
+  dims = 1:30
+)
+gc()
+mem.maxVSize(120000)
+
+# integrate
+lvint_full <- IntegrateData(
+  anchorset = anchors,
+  normalization.method = "SCT"
+)
+gc()
+
+# dimensional reduction
+lvint_full <- lvint_full %>% 
+  RunPCA(verbose = TRUE) %>%
+  RunUMAP(
+  lvint_full, 
+  dims = 1:30,
+  n.components = 3L,
+  return.model = TRUE,
+  reduction.name = "umap3D",
+  reduction.key = "UMAP3D_"
+  ) %>%
+  FindNeighbors(dims = 1:30) %>%
+  FindClusters(resolution = 0.8, cluster.name = "snn_res.0.8") %>% #used this resolution throughout
+  FindClusters(resolution = 1, cluster.name = "snn_res.1") #checked another out of curiosity
+
+# save the integrated object
+saveRDS(lvint_full, here::here("objects", "rpca_integrated_combined_full.rds"))
+beep(sound = 4) #notify that integration is done.
+Sys.sleep(time = 2)
+```
+#pseudotime analysis for figure 4D and pseudotime supp fig 
+
+This analysis exploits the projection of cc onto the atlas_full manifold by MapQuery. It looks at every cell from the cultures and asks, "among atlas cells, what 20 cells are closest to a given cultured cell, how far away are they, and what is their age (in hpf)". From there, it computes a distance-weighted average of the age of the 20 nearest atlas neighbors, which is used as input for later analyses.
+
+```{r pseudotime assignment}
+# Extract UMAP embeddings
+atlas_coords <- Embeddings(atlas_full, reduction = "umap3D")
+cc_coords    <- Embeddings(cc, reduction = "ref.umap.atlasfull")
+
+# Filter atlas cells to only those with known devtime (should be all of them)
+#n.b., devtime is derived from orig.ident. its a numeric value that is the hpf of the atlas cell
+valid_atlas <- which(!is.na(atlas_full$devtime))
+atlas_coords_filtered <- atlas_coords[valid_atlas, ]
+devtime_vals <- atlas_full$devtime[valid_atlas]
+
+# Find 20 nearest atlas neighbors for each cc cell
+k_neighbors <- 20
+nn <- get.knnx(data = atlas_coords_filtered, query = cc_coords, k = k_neighbors) #fxn rom FNN package
+
+# Compute distance-weighted average devtime
+pseudotime <- numeric(nrow(cc_coords))
+for (i in seq_len(nrow(cc_coords))) {
+  dists <- nn$nn.dist[i, ]
+  devs  <- devtime_vals[nn$nn.index[i, ]]
+  weights <- 1 / (dists + 1e-6)  # weight is 1/(dist + epsilon) to avoid division by zero
+  pseudotime[i] <- sum(weights * devs) / sum(weights) # weighted average of devtime from k=20 nearest neighbors when projected via mapquery to atlas manifold
+}
+
+# Save into cc object metadata
+cc$pseudotime <- pseudotime
+#save cc
+saveRDS(cc, file = here("objects/cc_with_pseudotime.rds"))
+
+#tibble with pseudotime and barcodes
+cc_pseudotime <- tibble(
+  cell_barcode = rownames(cc@meta.data),  #cell barcodes
+  pseudotime = cc@meta.data$pseudotime   #pseudotime values
+)
+
+# Check the resulting tibble
+head(cc_pseudotime)
+
+# put time into lvint metadata using pseudotime for cultured cells and devtime for atlas cells
+#used for supplemental pseudotime plot in integrated umap space
+all_lvint_pseudotime <- rep(NA_real_, ncol(lvint_full))
+names(all_lvint_pseudotime) <- colnames(lvint_full)
+cc_cell_names <- colnames(cc)
+matching_indices_in_lvint <- match(cc_cell_names, colnames(lvint_full))
+matching_indices_in_lvint <- matching_indices_in_lvint[!is.na(matching_indices_in_lvint)]
+pseudotime_values_for_cc <- cc$pseudotime
+all_lvint_pseudotime[matching_indices_in_lvint] <- pseudotime_values_for_cc
+lvint_full$pseudotime <- all_lvint_pseudotime
+
+# Check if pseudotime is correctly assigned
+head(lvint_full$pseudotime)
+tail(lvint_full$pseudotime)
+unique(lvint_full$pseudotime)
+summary(lvint_full$pseudotime)
+
+# Add combined time (devtime or cc depending on sample source) to lvint_full metadata
+lvint_full@meta.data <- lvint_full@meta.data %>%
+  mutate(
+    combined_time = case_when(
+      !is.na(devtime) ~ devtime,
+      !is.na(pseudotime) ~ pseudotime,
+      TRUE ~ NA_real_ # Assign NA if both are NA
+    )
+  )
+
+```
+
+
+### PAPER FIGURES ###
+
+# FIGURE 4A 
+
+goals for 4A: 
+* plot by orig.ident (hpf or fbs percentage) with diff color scales for cells and cultures. 
+* emphasize skeletogenic and pigment cells explicitly with a black outline around points. 
+* label centroids of celltypes clearly (added all here, but really only want for purpose of accurate placement of labels in illustrator duing figure assembly). 
+* minimize impact of overplotting in cultured cells, which cluster more densely. 
+```{r orig.ident with clusters and samplesource in lvint}
+
+
+##############################################################################################
+############################                                      ############################
+#                                         PREP DATA                                          #
+############################                                      ############################
+##############################################################################################
+
+
+# pull UMAP embeddings
+fig4a_umap_df <- Embeddings(lvint_full, reduction = "umap3D") %>% # Use umap3D
+  as.data.frame() %>%
+  select(UMAP3D_1 = 1, UMAP3D_2 = 2) # Select first two dims
+
+# pull metadata fields
+fig4a_meta_data <- lvint_full@meta.data %>%
+  select(
+    orig.ident,
+    samplesource,
+    predicted.celltype,
+    predicted.celltype.score,
+    snn_res1 = snn_res.0.8 
+  )
+
+# Combine embeddings and metadata
+# Ensure rownames match (should be cell barcodes)
+if (!identical(rownames(fig4a_umap_df), rownames(fig4a_meta_data))) {
+    # Attempt to fix if only order differs
+    common_cells <- intersect(rownames(fig4a_umap_df), rownames(fig4a_meta_data))
+    if (length(common_cells) == nrow(fig4a_umap_df) && length(common_cells) == nrow(fig4a_meta_data)) {
+        warning("Rownames between coordinates and metadata were mismatched but contained the same cells. Reordering metadata.")
+        fig4a_meta_data <- fig4a_meta_data[rownames(fig4a_umap_df), , drop = FALSE]
+    } else {
+        stop("Rownames mismatch between coordinates and metadata, and cell sets differ.")
+    }
+}
+#honestly kind of silly. could've just done rownames to col and selected the new column. still, works
+fig4a_umap_plot_data <- cbind(fig4a_umap_df, fig4a_meta_data)
+
+#factor order
+fig4a_ordered_levels <- c(
+    "Lv-2hpf", "Lv-3hpf", "Lv-4hpf", "Lv-5hpf", "Lv-6hpf", "Lv-7hpf",
+    "Lv-8hpf", "Lv-9hpf", "Lv-10hpf", "Lv-11hpf", "Lv-12hpf", "Lv-13hpf",
+    "Lv-14hpf", "Lv-15hpf", "Lv-16hpf", "Lv-18hpf", "Lv-20hpf", "Lv-24hpf",
+    "Lv_5FBS", "Lv_10FBS", "Lv_15FBS"
+)
+#convert orig.ident to factor specified order
+fig4a_umap_plot_data <- fig4a_umap_plot_data %>%
+  mutate(orig.ident = factor(orig.ident, levels = fig4a_ordered_levels))
+
+
+
+##############################################################################################
+############################                                      ############################
+#                                   EXPLICIT EMPHASIS LOGIC                                  #
+############################                                      ############################
+##############################################################################################
+
+# emphasized types (explicit)
+fig4a_explicit_emphasized_types <- c("Skeletogenic", "Pigment")
+
+# add explicit emphasis column
+fig4a_umap_plot_data <- fig4a_umap_plot_data %>%
+  mutate(explicit_emphasize = predicted.celltype %in% fig4a_explicit_emphasized_types)
+
+
+##############################################################################################
+############################                                      ############################
+#                                NEIGHBORHOOD EMPHASIS LOGIC                                 #
+############################                                      ############################
+##############################################################################################
+
+# find 200 nearest neighbors in the 2D space used for plotting - 2D space is used here because the point is the visibility in a 2D plot, not conveying precise neighbor info. 
+fig4a_coords <- as.matrix(fig4a_umap_plot_data[, c("UMAP3D_1", "UMAP3D_2")])
+fig4a_nn_result <- FNN::get.knn(fig4a_coords, k = 200)
+
+# pull metadata needed for loop
+fig4a_cell_sources <- fig4a_umap_plot_data$samplesource
+fig4a_is_explicitly_emphasized <- fig4a_umap_plot_data$explicit_emphasize
+
+# build neighborhood emphasis vector
+fig4a_neighborhood_emphasize <- rep(FALSE, nrow(fig4a_umap_plot_data))
+
+for (i in 1:nrow(fig4a_umap_plot_data)) {
+  #progress message for long loop
+  if (i %% 10000 == 0) {
+      message("Processing neighborhood emphasis for cell ", i, " of ", nrow(fig4a_umap_plot_data))
+  }
+  neighbors_idx <- fig4a_nn_result$nn.index[i, ]
+  neighbors_sources <- fig4a_cell_sources[neighbors_idx]
+  my_source <- fig4a_cell_sources[i]
+
+  frac_atlas <- mean(neighbors_sources == "atlas")
+  frac_cultures <- mean(neighbors_sources == "cultures")
+
+  min_dist <- min(fig4a_nn_result$nn.dist[i, ])
+
+  # Only emphasize if not already explicitly emphasized
+  if (!fig4a_is_explicitly_emphasized[i]) {
+    # Emphasize cultured cells if a) very close to at least one atlas cell and 
+      # b) >75% of nearest neighbors are from atlas
+    if (my_source == "cultures" && min_dist < 0.1 && frac_atlas > 0.75) {
+      fig4a_neighborhood_emphasize[i] <- TRUE
+    }
+    # Emphasize atlas cell if a) very close to at least one cultured cell and 
+      # b) >75% of nearest neighbors are from cultures
+    if (my_source == "atlas" && min_dist < 0.1 && frac_cultures > 0.75) {
+      fig4a_neighborhood_emphasize[i] <- TRUE
+    }
+  }
+}
+
+#Clean up 
+rm(fig4a_coords, fig4a_nn_result, neighbors_idx, neighbors_sources)
+
+#Add neighborhood emphasis to the plot data
+fig4a_umap_plot_data$neighborhood_emphasize <- fig4a_neighborhood_emphasize
+
+
+##############################################################################################
+##############################################################################################
+################                                                              ################
+#                            ARRANGE DATA AND PREP FOR PLOTTING                              #
+################                                                              ################
+##############################################################################################
+##############################################################################################
+
+
+# Arrange subsets by the ordered orig.ident factor to control plotting order
+
+fig4a_atlas_normal <- fig4a_umap_plot_data %>%
+    dplyr::filter(samplesource == "atlas", !explicit_emphasize, !neighborhood_emphasize) %>%
+    dplyr::arrange(orig.ident)
+fig4a_atlas_neighbor <- fig4a_umap_plot_data %>%
+    dplyr::filter(samplesource == "atlas", neighborhood_emphasize) %>%
+    dplyr::arrange(orig.ident)
+
+fig4a_culture_normal <- fig4a_umap_plot_data %>%
+    dplyr::filter(samplesource == "cultures", !explicit_emphasize, !neighborhood_emphasize) %>%
+    dplyr::arrange(orig.ident)
+fig4a_culture_neighbor <- fig4a_umap_plot_data %>%
+    dplyr::filter(samplesource == "cultures", neighborhood_emphasize) %>%
+    dplyr::arrange(orig.ident)
+fig4a_culture_explicit <- fig4a_umap_plot_data %>%
+    dplyr::filter(samplesource == "cultures", explicit_emphasize) %>%
+    dplyr::arrange(orig.ident)
+
+# Calculate centroids from cultured cells
+fig4a_centroids_cultures <- fig4a_umap_plot_data %>%
+  dplyr::filter(samplesource == "cultures", !is.na(predicted.celltype)) %>% 
+  dplyr::group_by(predicted.celltype) %>%
+  dplyr::summarize(
+    UMAP3D_1 = median(UMAP3D_1, na.rm = TRUE), 
+    UMAP3D_2 = median(UMAP3D_2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Define color scales
+fig4a_atlas_color_scale <- scale_color_viridis_d(
+    option = "plasma",   # Use plasma scale - remove ends which are too dark/light for good visibility
+    begin = 0.1,         # Trim bottom 10%
+    end = 0.9,           # Trim top 10%
+    na.translate = FALSE,
+    name = "Atlas Sample", # Legend title
+    # Set legend guide options
+    guide = guide_legend(override.aes = list(size = 4, shape = 16, alpha = 1), order = 1)
+)
+fig4a_cultures_color_scale <- scale_color_viridis_d(
+    option = "viridis",  # Use viridis scale - middle 50% which doesnt have overlap with the plasma scale
+    begin = 0.25,        # Start at 25%
+    end = 0.75,          # End at 75% (middle 50%)
+    na.translate = FALSE,
+    name = "Culture Sample", # Legend title
+    # Set legend guide options
+    guide = guide_legend(override.aes = list(size = 4, shape = 16, alpha = 1), order = 2)
+)
+
+# Fill scale for explicitly emphasized cultures (matched to color scale)
+fig4a_cultures_fill_scale <- scale_fill_viridis_d(
+    option = "viridis",
+    begin = 0.25,
+    end = 0.75,
+    na.translate = FALSE,
+    guide = "none" # No separate legend for fill
+)
+
+
+##############################################################################################
+##############################################################################################
+################                                                              ################
+#                                       PLOTTING                                             #
+################                                                              ################
+##############################################################################################
+##############################################################################################
+
+
+# Start building the plot layers (order doesnt really matter - can reorder if needed in illustrator)
+fig4a_p_final <- ggplot() +
+#Atlas layers
+  # Atlas points (normal)
+  geom_point(
+    data = fig4a_atlas_normal,
+    aes(x = UMAP3D_1, y = UMAP3D_2, color = orig.ident),
+    size = 0.1, alpha = 0.3 # Smaller size, lower alpha
+  ) +
+  # Atlas points (neighborhood emphasized)
+  geom_point(
+    data = fig4a_atlas_neighbor,
+    aes(x = UMAP3D_1, y = UMAP3D_2, color = orig.ident),
+    size = 1.5, alpha = 1, 
+    shape = 16 
+  ) +
+  # Apply trimmed plasma scale (middle 80%) for atlas layers
+  fig4a_atlas_color_scale +
+
+  #new colors scale for cultured cells
+  ggnewscale::new_scale_color() +
+  ggnewscale::new_scale_fill() + # Also need new scale for fill (enables explicit emphasis border)
+
+#Cultured cell layers
+  #Culture points (normal)
+  geom_point(
+    data = fig4a_culture_normal,
+    aes(x = UMAP3D_1, y = UMAP3D_2, color = orig.ident),
+    size = 0.1, alpha = 0.2 
+  ) +
+  #Culture points (neighborhood emphasized)
+  geom_point(
+    data = fig4a_culture_neighbor,
+    aes(x = UMAP3D_1, y = UMAP3D_2, color = orig.ident),
+    size = 1.5, alpha = 1, 
+    shape = 16 
+  ) +
+  #Culture points (explicitly emphasized, thin border)
+  geom_point(
+    data = fig4a_culture_explicit,
+    aes(x = UMAP3D_1, y = UMAP3D_2, fill = orig.ident), 
+    color = "black", 
+    size = 1.625, alpha = 1, 
+    stroke = 0.01, shape = 21 
+  ) +
+  #apply middle 50% of viridis scale (color and fill) for cultured cell layers
+  fig4a_cultures_color_scale +
+  fig4a_cultures_fill_scale +
+
+
+  # Use single repel call with centroids_cultures
+  #most labels are removed in illustrator - this is just to enable me to get the centroid locations exactly right when assembling the combination fogure
+  geom_text_repel(
+    data = fig4a_centroids_cultures, 
+    aes(x = UMAP3D_1, y = UMAP3D_2, label = predicted.celltype),
+    size = 3.0, fontface = "bold", color = "black",
+    box.padding = 0.5, point.padding = 0.5, 
+    segment.size = 0.4, segment.color = "black",
+    min.segment.length = 0, max.overlaps = Inf, show.legend = FALSE,
+    force_pull = 1, nudge_x = 0, nudge_y = 0  
+  ) +
+
+  # Theme - kind of doesnt matter - will all be tweaked in illustrator to meet journal guidelines
+    # wound up changing all text, removing and replacing axes (as specific coords are relatively meaningless)
+  labs(x = "UMAP1", y = "UMAP2") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    legend.position = "right",
+    legend.key.height = unit(0.6, "lines"),
+    legend.text = element_text(size = 10),
+    legend.box = "vertical"  
+  ) +
+  guides(fill = "none") # dont need legend for fill scale
+
+# Print the final plot
+print(fig4a_p_final)
+
+dir.create(here("plots", "fig4opt"), recursive = TRUE, showWarnings = FALSE)
+
+# Create timestamp - used for filenames
+timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+
+# Save PNG - DIDNT USE BC NEEDED FONT EMBEDDING
+
+ggsave(
+  plot = fig4a_p_final,
+  filename = here("plots", "fig4opt", paste0("fig4A_", timestamp, ".png")),
+  width = 9.5,
+  height = 7,
+  dpi = 600,
+  bg = "transparent"
+)
+
+# Save SVG - USED THIS ONE
+ggsave(
+  plot = fig4a_p_final,
+  filename = here("plots", "fig4opt", paste0("fig4A_", timestamp, ".svg")),
+  device = svglite,
+  width = 9.5,
+  height = 7,
+  bg = "transparent"
+)
+
+```
+
+#FIGURE 4B
+literally just a cluster dimplot that gives context to the tree below. 
+kept neighborhood emphasis logic from figure 4A for this, but it is subtle. Hopefully will help a reviewer to pick out the kind of oddball cells they may care about after looking at 4A.
+```{r figure 4B cluster dimplot with emphasis and different colors}
+
+#extract data
+umap_embeddings_3d <- Embeddings(lvint_full, reduction = "umap3D")
+cell_identifiers <- rownames(umap_embeddings_3d)
+
+plotting_dataframe <- data.frame(
+  UMAP_1 = umap_embeddings_3d[, 1],
+  UMAP_2 = umap_embeddings_3d[, 2],
+  UMAP_3 = umap_embeddings_3d[, 3], 
+  cluster_assignment = factor(lvint_full@meta.data[cell_identifiers, "snn_res.0.8"]),
+  sample_origin = factor(lvint_full@meta.data[cell_identifiers, "samplesource"]),
+  cell_id = cell_identifiers,
+  stringsAsFactors = FALSE
+)
+
+#identify cells to be emphasized
+num_neighbors_to_search <- 200
+neighbor_proportion_threshold <- 0.75
+neighbor_distance_threshold <- 0.1
+coordinates_for_nn <- as.matrix(plotting_dataframe[, c("UMAP_1", "UMAP_2", "UMAP_3")])
+
+# Perform NN search 
+nn_search_results <- get.knnx(data = coordinates_for_nn, query = coordinates_for_nn, k = min(num_neighbors_to_search + 1, nrow(coordinates_for_nn)))
+neighbor_indices_matrix <- nn_search_results$nn.index[, -1, drop = FALSE]
+neighbor_distances_matrix <- nn_search_results$nn.dist[, -1, drop = FALSE]
+plotting_dataframe$is_emphasized_cell <- FALSE
+
+#reimplemented neighborhood emphasis logic
+for (i in 1:nrow(plotting_dataframe)) {
+  current_cell_sample_origin <- plotting_dataframe$sample_origin[i]
+
+  actual_num_neighbors <- ncol(neighbor_indices_matrix) 
+  if (actual_num_neighbors == 0) next # Skip if no neighbors found (i.e., k=0 for some reason)
+    
+  indices_of_neighbors <- neighbor_indices_matrix[i, 1:actual_num_neighbors]
+  sample_origins_of_neighbors <- plotting_dataframe$sample_origin[indices_of_neighbors]
+  distances_to_neighbors <- neighbor_distances_matrix[i, 1:actual_num_neighbors]
+    
+  opposite_source_neighbors_mask <- sample_origins_of_neighbors != current_cell_sample_origin
+  count_opposite_source_neighbors <- sum(opposite_source_neighbors_mask)
+  
+  # Use actual_num_neighbors for proportion calculation if it's less than num_neighbors_to_search
+  effective_search_count <- min(num_neighbors_to_search, actual_num_neighbors)
+  # Calculate proportion of opposite source neighbors and advance cells with >75% of neighbors from opposing source
+  if (effective_search_count > 0 && (count_opposite_source_neighbors / effective_search_count >= neighbor_proportion_threshold)) {
+    distances_to_opposite_source_neighbors <- distances_to_neighbors[opposite_source_neighbors_mask]
+    # Check if any of the distances to opposite source neighbors are below 0.1 threshold
+    if (length(distances_to_opposite_source_neighbors) > 0) {
+      min_distance_to_opposite_neighbor <- min(distances_to_opposite_source_neighbors)
+      if (min_distance_to_opposite_neighbor < neighbor_distance_threshold) {
+        # Mark cell as emphasized
+        plotting_dataframe$is_emphasized_cell[i] <- TRUE
+      }
+    }
+  }
+}
+
+
+#prep data for plotting
+#split along emphasis
+df_non_emphasized_orig <- plotting_dataframe[!plotting_dataframe$is_emphasized_cell, ]
+df_emphasized_orig <- plotting_dataframe[plotting_dataframe$is_emphasized_cell, ]
+
+#shuffle dfs to minimize overplotting impacts
+plot_df_non_emphasized <- df_non_emphasized_orig %>% sample_n(size = nrow(.), replace = FALSE)
+plot_df_emphasized <- df_emphasized_orig %>% sample_n(size = nrow(.), replace = FALSE)
+
+#define cluster colors 
+number_of_clusters <- nlevels(plotting_dataframe$cluster_assignment)
+cluster_levels <- levels(plotting_dataframe$cluster_assignment)
+final_cluster_colors <- NULL 
+
+
+palette_colors <- DiscretePalette(n = number_of_clusters, palette = NULL)
+names(palette_colors) <- cluster_levels
+final_cluster_colors <- palette_colors
+
+# Calculate cluster centroids for labels
+cluster_centroids <- plotting_dataframe %>%
+  filter(!is.na(cluster_assignment)) %>% 
+  group_by(cluster_assignment) %>%
+  summarise(
+    UMAP_1_mean = mean(UMAP_1, na.rm = TRUE),
+    UMAP_2_mean = mean(UMAP_2, na.rm = TRUE),
+    .groups = 'drop' # Drop grouping structure after summarising
+  )
+
+# Define point border colors and add to emphasized dataframe
+atlas_border_color <- "#d73027"
+cultures_border_color <- "#4575b4"
+plot_df_emphasized$actual_border_color <- NA_character_
+plot_df_emphasized$actual_border_color[plot_df_emphasized$sample_origin == "atlas"] <- atlas_border_color
+plot_df_emphasized$actual_border_color[plot_df_emphasized$sample_origin == "cultures"] <- cultures_border_color
+
+# Calculate data range for plot limits using the original full dataframe
+x_range <- range(plotting_dataframe$UMAP_1, na.rm = TRUE)
+y_range <- range(plotting_dataframe$UMAP_2, na.rm = TRUE)
+x_buffer <- (x_range[2] - x_range[1]) * 0.05
+y_buffer <- (y_range[2] - y_range[1]) * 0.05
+
+# Define font size in points for consistency
+font_size_pt <- 7
+# Convert pt to mm for ggrepel size (approximate, as ggplot's internal size unit is mm for text)
+geom_text_repel_size_mm <- font_size_pt / ggplot2::.pt 
+
+#plot
+p <- ggplot() +
+  #Non-emphasized cells (shuffled)
+  geom_point(
+    data = plot_df_non_emphasized,
+    mapping = aes(x = UMAP_1, y = UMAP_2, color = cluster_assignment),
+    shape = 16,
+    alpha = 0.4, low to help with overplotting
+    size = 0.4
+  ) +
+  scale_color_manual(
+    name = "snn_res.0.8",
+    values = final_cluster_colors,
+    na.value = "grey50",
+    drop = FALSE,
+    guide = guide_legend(
+      override.aes = list(shape = 16, size = 3, alpha = 1)
+    )
+  ) +
+  new_scale_color() + #reset color scale for emphasis layer
+  #emphasized cells
+  geom_point(
+    data = plot_df_emphasized,
+    mapping = aes(x = UMAP_1, y = UMAP_2, fill = cluster_assignment, color = actual_border_color),
+    shape = 21,
+    alpha = 1.0,
+    size = 0.9,
+    stroke = 0.1
+  ) +
+  scale_fill_manual(
+    name = "snn_res.0.8", 
+    values = final_cluster_colors,
+    na.value = "grey50",
+    drop = FALSE,
+    guide = "none" 
+  ) +
+  scale_color_identity( 
+    guide = "none"
+  ) +
+  #Cluster labels
+  geom_text_repel(
+    data = cluster_centroids,
+    mapping = aes(x = UMAP_1_mean, y = UMAP_2_mean, label = cluster_assignment),
+    size = geom_text_repel_size_mm,          
+    box.padding = 0.25,   
+    point.padding = 0.25, 
+    segment.color = 'grey50', 
+    segment.size = 0.3,   
+    min.segment.length = 0 
+  ) +
+  #limits and border space management
+  coord_cartesian(
+    xlim = c(x_range[1] - x_buffer, x_range[2] + x_buffer),
+    ylim = c(y_range[1] - y_buffer, y_range[2] + y_buffer),
+    expand = FALSE 
+  ) +
+  #theme is kind of pointless. i wound up managing all this in illustrator
+  theme_classic(base_size = font_size_pt) + 
+  theme(
+    plot.margin = unit(c(0, 0, 0, 0), "cm"), 
+    panel.border = element_blank(), 
+    axis.line = element_line(colour = "black", linewidth = 0.5), 
+    # More compact legend
+    legend.key.size = unit(0.4, "cm"),
+    legend.spacing.y = unit(0.1, "cm"), 
+    legend.title = element_text(size = rel(1.0)), 
+    legend.text = element_text(size = rel(1.0)),  
+    axis.title = element_text(size = rel(1.0)),
+    axis.text = element_text(size = rel(1.0)),
+    plot.title = element_text(size = rel(1.2)) 
+  ) +
+  labs(
+    x = "UMAP 1", 
+    y = "UMAP 2", 
+    title = "Customized UMAP Plot"
+  )
+
+print(p)
+
+#save
+dir.create(here("plots", "4Bclust"), recursive = TRUE, showWarnings = FALSE)
+ggsave(
+  filename = here("plots", "4Bclust", "4B.svg"),
+  plot = p,
+  width = 5, 
+  height = 4, 
+  units = "in",
+  device = 'svg'
+)
+```
+
+
+#FIGURE 4C 
+tree and stacked bars (one per chunk) were combined in illustrator to create the final figure 4C.
+Tree is rooted in cluster 3 (which is mostly 2hpf blastomeres), under the logic that this would make the clustering representative of developmental progression, and that we could see where the cultured cells fit into that. 
+
+Figure 4C (tree)
+```{r tree stuff - fig 4 C}
+
+# Generate the Phylogenetic Tree (tree_obj)
+Idents(lvint_full) <- "snn_res.0.8"
+
+lvint_full <- BuildClusterTree(
+  object = lvint_full,
+  dims = 1:30,
+  reduction = "pca",
+  assay = "integrated"
+)
+
+tree_obj <- lvint_full@tools$`BuildClusterTree`
+
+# Root the Tree 
+rooted_tree_obj <- ape::root(tree_obj, outgroup = "3", resolve.root = TRUE)
+
+# Create and Print Base ggtree Plot
+base_ggtree_plot <- ggtree(rooted_tree_obj, layout = 'rectangular') +
+  geom_tiplab(align = TRUE, linesize = 0.5, size = 3) +
+  theme(legend.position = "right")
+
+print(base_ggtree_plot)
+
+
+ggsave("ggtree_base_plot.png", plot = base_ggtree_plot, width = 3, height = 5, dpi = 300)
+ggsave("ggtree_base_plot.svg", plot = base_ggtree_plot, width = 3, height = 5, device = svglite::svglite)
+```
+Figure 4C (stacked bars)
+```{r stacked bars}
+# Extract Cluster Order from ggtree Plot
+ggtree_data <- base_ggtree_plot$data
+
+cluster_order_bottom_to_top_from_plot <- ggtree_data %>%
+  filter(isTip == TRUE) %>%
+  arrange(y) %>%
+  pull(label)
+
+# Prepare Stacked Bar Data
+prop_df_full <- lvint_full@meta.data %>%
+  filter(!is.na(.data[["snn_res.0.8"]]), !is.na(.data[["samplesource"]])) %>%
+  group_by(.data[["snn_res.0.8"]], .data[["samplesource"]]) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(.data[["snn_res.0.8"]]) %>%
+  mutate(prop = count / sum(count)) %>%
+  ungroup() %>%
+  dplyr::rename(cluster = .data[["snn_res.0.8"]]) %>% #dplyr's rename is masked so call explicitly
+  mutate(cluster = as.character(cluster))
+
+
+# Create and Print Standalone Stacked Bar Plot
+stacked_bar_colors <- c(
+  atlas = "#BB3754FF",#close to median color of scale from 4A
+  cultures = "#21908CFF" #close to median color of scales from 4A and 4D
+)
+
+standalone_stacked_bar_plot <- ggplot(
+  prop_df_full,
+  aes(
+    x = prop,
+    y = factor(cluster, levels = cluster_order_bottom_to_top_from_plot),
+    fill = samplesource
+  )
+) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = stacked_bar_colors, name = "Sample Source") +
+  scale_y_discrete() +
+  labs(
+    x = "Proportion",
+    y = "Cluster"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+
+print(standalone_stacked_bar_plot)
+
+
+ggsave("standalone_stacked_bars-dim.png", plot = standalone_stacked_bar_plot, width = 1, height = 5, dpi = 300) #didnt use png
+ggsave("standalone_stacked_bars-dim.svg", plot = standalone_stacked_bar_plot, width = 1, height = 5, device = svglite::svglite) #used for embedded fonts and better manipulation for alignment with tree
+```
+
+#FIGURE 4D - pseudotime projection plot
+```{r Pseudotime plotting - FIGURE 4D}
+# Define the output directory and filename
+output_dir <- "./plots/paper_figs/2025-05-05/"
+filename <- "pseudotime_projection_plot_fig4.svg"
+full_output_path <- file.path(output_dir, filename)
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Prepare UMAP coordinates
+atlas_embed <- Embeddings(atlas_full, "umap3D")[, 1:2]
+cc_embed    <- Embeddings(cc, "ref.umap.atlasfull")[, 1:2]
+
+# Dataframes for plotting
+atlas_df <- data.frame(
+  x = atlas_embed[, 1],
+  y = atlas_embed[, 2],
+  group = atlas_full$orig.ident
+)
+
+cc_df <- data.frame(
+  x = cc_embed[, 1],
+  y = cc_embed[, 2],
+  pseudotime = cc$pseudotime
+)
+
+set.seed(123)
+#shuffle points in cc to limit impact of overplotting
+cc_df <- cc_df[sample(nrow(cc_df)), ]
+
+# Extract hpf values and order groups - could've just used devtime tbh
+atlas_hpf <- as.numeric(gsub("[^0-9]", "", atlas_df$group))
+atlas_order <- atlas_df$group[order(atlas_hpf)]
+atlas_order <- unique(atlas_order)
+atlas_df$group <- factor(atlas_df$group, levels = atlas_order)
+
+# Generate greyscale palette
+n_groups <- length(atlas_order)
+greyscale_colors <- grey(seq(from = 0.9, to = 0.1, length.out = n_groups))
+names(greyscale_colors) <- atlas_order
+
+# Create label dataframe (centroid for each group)
+# originally I labeled hpf on this plot, but I wound up not using this. 
+atlas_labels <- atlas_df %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarize(
+    x = median(x),
+    y = median(y),
+    .groups = "drop"
+  )
+
+# Build plot
+p_pseudotime <- ggplot() +
+  # Atlas cells colored faintly by orig.ident group 
+  # not terribly important, really just serves as a scaffold/context in which to understand pseudotime
+  geom_point(
+    data = atlas_df,
+    aes(x = x, y = y, color = group),
+    size = 0.3,
+    alpha = 0.3,
+    shape = 16
+  ) +
+  # Use the new greyscale color scale
+  scale_color_manual(
+    values = greyscale_colors, #we use a light to dark scale here bc we want the viridis colors to 'pop' against it 
+                                #(i.e., we want the "bright" and "dark" ends of each scale to be going in different directions)
+    guide = guide_legend(
+      title = "Atlas Sample",
+      ncol = 1,
+      override.aes = list(
+         # Use larger points for legend - wound up replacing with gradient bar
+        size = 4,
+        shape = 16,
+        color = greyscale_colors,
+        alpha = 0.9
+      )
+    )
+  ) +
+  ggnewscale::new_scale_color() +
+  # Cultured cells colored by pseudotime
+  #this is the important bit of this plot
+  geom_point(
+    data = cc_df,
+    aes(x = x, y = y, color = pseudotime),
+    size = 0.6,
+    shape = 16,
+    alpha = 0.5
+  ) +
+  scale_color_viridis_c(option = "D", name = "Pseudotime") + #viridis scale (the whole thing) - 
+  # yellows are normally an issue on white background for this, but they're up against the nearly black end of the greyscale color scale used for devtime
+  #theme here sort of doesnt matter - all gets changed later in illustrator
+  labs(x = "UMAP1", y = "UMAP2") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "left",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 10),
+    legend.key.height = unit(0.6, "lines")
+  )
+
+print(p_pseudotime)
+
+# Save the plot
+ggsave(
+  filename = full_output_path,
+  plot = p_pseudotime,
+  width = 9.5,
+  height = 7,
+  device = "svg"
+)
+```
+
+### SUPPLEMENTAL FIGURES
+kept these pretty simple compared to the very fine-scale tweaking above. 
+# FIGURE S7
+```{r dotplot}
+#genes to plot
+dotplot_genes <- c("LOC121432141:Tcf", "LOC121427575:HesC", "LOC121430133:SoxB1", "LOC121423867:Ptb", 
+                   "LOC447794:Alx1", "LOC121430637:SoxC", "LOC100500774:FoxN2/3", "LOC121419770:Ets1/2",
+                   "LOC121425598:Fgfr", "LOC121418261:Otx", "LOC121420990:Ese", "LOC121411816:GataC",
+                   "LOC121418266:Prox1", "LOC121423567:Scl", "LOC121431399:Id", "LOC121428528:Pks1",
+                   "LOC121430542:Gcm", "LOC121418887:Six1/2", "LOC121429154:Z166", "LOC121419686:Gatae", 
+                   "LOC447795:Notch", "LOC121431291:Tgif", "LOC121406173:Endo16", "LOC121419318:FoxA",
+                   "LOC121418892:Six3", "LOC121409326:Lim1", "LOC121416136:Rkhd", "LOC121408301:Atbf1", 
+                   "LOC121423785:Klf7", "LOC121408762:Seawi-1", "LOC447797:Cycb-1", "LOC121410426:CycA", 
+                   "LOC121410780:Mki67ipL", "LOC121431754:Pcna", "LOC121409399:LhH1a", "LOC121418431:Slc10a2-5",
+                   "LOC121424121:Dmrt", "LOC121423325:Kdelr2", "LOC121428095:Btub1", "LOC121423158:ApobL",  
+                   "LOC121422986:Aqp8", "LOC121418873:Pus10", "LOC121425480:B4galt5-1",
+                   "LOC121424948:Igcam/Igcam", "LOC121423902:Pnkp", "LOC121419788", "LOC121408936:Dem1", 
+                   "LOC121429754:Chd1l",  "LOC121423799:Mnk2",   "LOC121431314:Mfsd2",  "LOC121415051:FoxY",
+                   "LOC121420063:none",   "LOC121419306:NA",     "LOC121413928:Vparpf")
+
+length(dotplot_genes)
+
+# order of clusters to match tree
+cluster_order <- c(3, 16, 25, 2, 12, 9, 22, 11, 7, 10, 15, 17, 33, 19, 23, 30, 18, 8, 29, 13, 32, 21, 24,
+                   14, 20, 27, 5, 4, 26, 34, 1, 28, 6, 0, 31)
+
+#reorder as factor
+lvint_full$snn_res.0.8_ordered <- factor(lvint_full$snn_res.0.8, levels = cluster_order)
+
+# Generate the DotPlot
+dot_plot <- DotPlot(
+    object = lvint_full,
+    features = dotplot_genes,
+    group.by = "snn_res.0.8_ordered" 
+) +
+  ylab(label = NULL) +
+  xlab(label = NULL) +
+  #theme is kind of BS. wound up adjusting in illustrator
+theme(axis.text.x = element_text(angle = -45, 
+                                 hjust = 1,
+                                 vjust = 0.5,
+                                 size = 8),
+      plot.margin = unit(c(0,0,2,2), "cm"), 
+      plot.background = element_blank(),
+      legend.position = "none") +
+  scale_color_viridis_c()
+
+#Print and save
+print(dot_plot)
+dir.create(here("plots", "dotplot"), recursive = T, showWarnings = F)
+ggsave(filename = here("plots", "dotplot", "supp_dotplot_no_legend_narrow_flippedlabs.svg"), plot = dot_plot, width = 6.5, height = 7.5)
+
+
+```
+
+# FIGURE S8
+these use plot_density() from the nebulosa package. In short, this is passing a 2d kernel density estimator over a featureplot/geom_point. The effect is a smoothing that helps to make better visualizations in sparse data like that generated by scRNAseq. 
+
+```{r featureplots with nebulosa}
+grab_feat_harder(lvint_full, common_names = "Pum")
+
+markers <- c("LOC121428528:Pks1", "LOC447794:Alx1", "LOC121420990:Ese", "LOC121417224:Pum", "LOC121408762:Seawi-1", "LOC121425246:Nanos2")
+
+#saves the six panels separately. these are assembled in illustrator to create figure S8. 
+#labels are simplified and edited for clarity in illustrator. 
+for(m in markers){
+  p <- plot_density(lvint_full, features = m, method = "wkde", size = 0.1) #from nebulosa package
+  print(p)
+  ggsave(filename = here("plots", "nebulosa", paste0("nebulosa_", cleanup(m), ".svg")), plot = p, height = 5, width = 5)
+}
+
+```
+
+
+# FIGURE S9
+pseudotime in integrated object for supplement
+```{r pseudotime and devtime plotted together in the integrated umap space}
+
+p <- FeaturePlot(lvint_full, features = "combined_time", order = FALSE, raster = FALSE) + #combined time defined above when calculating pseudotime 
+  scale_color_viridis_c() + 
+  ggtitle(label = "Hpf and culture pseudotime in integrated analysis UMAP space") +
+  xlab("UMAP 1") +
+  ylab("UMAP 2")
+
+print(p)
+
+dir.create(path = here("plots", "pseudotime_integrated"), recursive = T, showWarnings = F)
+ggsave(filename = here("plots", "pseudotime_integrated", "integrated_time.png"), plot = p, height = 7.5, width = 7.5, dpi = 600)
+ggsave(filename = here("plots", "pseudotime_integrated", "integrated_time.svg"), plot = p, height = 7.5, width = 7.5)
+```
+
+unsure at this point whether a supplemental table was included. if it is when we submit, I will add it here. 
+
+#session_info
+
+```{r session info}
+sessionInfo() %>% print()
+```
+
